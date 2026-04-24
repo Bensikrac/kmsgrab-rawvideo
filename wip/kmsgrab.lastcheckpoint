@@ -1,0 +1,191 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <string.h>
+#include <stdint.h>
+#include <errno.h>
+#include <drm.h>
+#include <drm_fourcc.h>
+#include <xf86drm.h>
+#include <xf86drmMode.h>
+
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <GLES3/gl3.h>
+
+#ifndef GL_TEXTURE_EXTERNAL_OES
+#define GL_TEXTURE_EXTERNAL_OES 0x8D65
+#endif
+
+typedef void (GL_APIENTRYP PFNGLEGLIMAGETARGETTEXTURE2DOESPROC) (GLenum target, void *image);
+typedef EGLImage (EGLAPIENTRYP PFNEGLCREATEIMAGEPROC) (EGLDisplay dpy, EGLContext ctx, EGLenum target, EGLClientBuffer buffer, const EGLAttrib *attrib_list);
+
+void print_fourcc(uint32_t format) {
+    char f[5];
+    f[0] = (format) & 0xFF;
+    f[1] = (format >> 8) & 0xFF;
+    f[2] = (format >> 16) & 0xFF;
+    f[3] = (format >> 24) & 0xFF;
+    f[4] = 0;
+    printf("Format: %s (0x%x)\n", f, format);
+}
+
+int main() {
+    int ret;
+    int drm_fd = open("/dev/dri/card0", O_RDWR);
+    if (drm_fd < 0) { perror("open"); return 1; }
+
+    // EGL Init
+    EGLDisplay display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    eglInitialize(display, NULL, NULL);
+
+    EGLint attribs[] = { EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT, EGL_NONE };
+    EGLConfig config; EGLint num_config;
+    eglChooseConfig(display, attribs, &config, 1, &num_config);
+    eglBindAPI(EGL_OPENGL_ES_API);
+    
+    EGLint ctx_attribs[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
+    EGLContext ctx = eglCreateContext(display, config, EGL_NO_CONTEXT, ctx_attribs);
+    eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx);
+
+    // Load Function Pointers
+    PFNEGLCREATEIMAGEPROC eglCreateImage = (PFNEGLCREATEIMAGEPROC)eglGetProcAddress("eglCreateImage");
+    PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES = 
+        (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress("glEGLImageTargetTexture2DOES");
+
+    if (!eglCreateImage || !glEGLImageTargetTexture2DOES) {
+        fprintf(stderr, "Failed to load EGL functions.\n");
+        return 1;
+    }
+
+    // Find FB
+    drmModeRes *res = drmModeGetResources(drm_fd);
+    uint32_t fb_id = 0;
+    for (int i = 0; i < res->count_connectors; i++) {
+        drmModeConnector *conn = drmModeGetConnector(drm_fd, res->connectors[i]);
+        if (conn->connection == DRM_MODE_CONNECTED && conn->encoder_id) {
+            drmModeEncoder *enc = drmModeGetEncoder(drm_fd, conn->encoder_id);
+            if (enc && enc->crtc_id) {
+                drmModeCrtc *crtc = drmModeGetCrtc(drm_fd, enc->crtc_id);
+                if (crtc) { fb_id = crtc->buffer_id; drmModeFreeCrtc(crtc); }
+                drmModeFreeEncoder(enc);
+            }
+            drmModeFreeConnector(conn);
+            if (fb_id) break;
+        }
+    }
+    if (!fb_id) return 1;
+
+    // Get FB Details
+    uint32_t width, height, pixel_format, pitch;
+    uint64_t modifier;
+    int prime_fd = -1;
+
+    drmModeFB2Ptr fb2 = drmModeGetFB2(drm_fd, fb_id);
+    if (fb2) {
+        width = fb2->width; height = fb2->height; pitch = fb2->pitches[0];
+        pixel_format = fb2->pixel_format; modifier = fb2->modifier;
+        ret = drmPrimeHandleToFD(drm_fd, fb2->handles[0], O_RDONLY, &prime_fd);
+        drmModeFreeFB2(fb2);
+    } else return 1;
+
+    if (ret || prime_fd < 0) return 1;
+
+    printf("Screen: %dx%d\n", width, height);
+    print_fourcc(pixel_format);
+    printf("Modifier: 0x%lx\n", modifier);
+
+    // -------------------------------------------------------
+    // CRITICAL FIX: Fallback Logic from gpu-screen-recorder
+    // -------------------------------------------------------
+    EGLImage image = EGL_NO_IMAGE_KHR;
+
+    // Attempt 1: With Modifiers
+    {
+        intptr_t img_attribs[32];
+        int k = 0;
+        img_attribs[k++] = EGL_WIDTH; img_attribs[k++] = width;
+        img_attribs[k++] = EGL_HEIGHT; img_attribs[k++] = height;
+        img_attribs[k++] = EGL_LINUX_DRM_FOURCC_EXT; img_attribs[k++] = pixel_format;
+        img_attribs[k++] = EGL_DMA_BUF_PLANE0_FD_EXT; img_attribs[k++] = prime_fd;
+        img_attribs[k++] = EGL_DMA_BUF_PLANE0_OFFSET_EXT; img_attribs[k++] = 0;
+        img_attribs[k++] = EGL_DMA_BUF_PLANE0_PITCH_EXT; img_attribs[k++] = pitch;
+        
+        if (modifier != DRM_FORMAT_MOD_INVALID) {
+            img_attribs[k++] = EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT; img_attribs[k++] = modifier & 0xFFFFFFFF;
+            img_attribs[k++] = EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT; img_attribs[k++] = modifier >> 32;
+        }
+        img_attribs[k++] = EGL_NONE;
+
+        image = eglCreateImage(display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, img_attribs);
+    }
+
+    // Attempt 2: Without Modifiers (Fallback)
+    if (!image) {
+        fprintf(stderr, "Import with modifiers failed, trying WITHOUT modifiers...\n");
+        intptr_t img_attribs[32];
+        int k = 0;
+        img_attribs[k++] = EGL_WIDTH; img_attribs[k++] = width;
+        img_attribs[k++] = EGL_HEIGHT; img_attribs[k++] = height;
+        img_attribs[k++] = EGL_LINUX_DRM_FOURCC_EXT; img_attribs[k++] = pixel_format;
+        img_attribs[k++] = EGL_DMA_BUF_PLANE0_FD_EXT; img_attribs[k++] = prime_fd;
+        img_attribs[k++] = EGL_DMA_BUF_PLANE0_OFFSET_EXT; img_attribs[k++] = 0;
+        img_attribs[k++] = EGL_DMA_BUF_PLANE0_PITCH_EXT; img_attribs[k++] = pitch;
+        // NO MODIFIER ATTRIBUTES HERE
+        img_attribs[k++] = EGL_NONE;
+
+        image = eglCreateImage(display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, img_attribs);
+    }
+
+    if (!image) {
+        fprintf(stderr, "eglCreateImage failed completely: 0x%x\n", eglGetError());
+        return 1;
+    }
+    
+    // Setup Texture (External OES)
+    GLuint tex_external;
+    glGenTextures(1, &tex_external);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, tex_external);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, image);
+
+    // Shader Setup
+    const char *vshader_src = 
+        "#version 300 es\nin vec2 pos;out vec2 v_tex;void main(){v_tex=pos*0.5+0.5;gl_Position=vec4(pos,0.0,1.0);}\n";
+    const char *fshader_src = 
+        "#version 300 es\n#extension GL_OES_EGL_image_external_essl3 : require\nprecision highp float;\n"
+        "in vec2 v_tex;uniform samplerExternalOES tex;out vec4 frag_color;\nvoid main(){frag_color=texture(tex,v_tex);}\n";
+
+    GLuint vshader = glCreateShader(GL_VERTEX_SHADER); glShaderSource(vshader, 1, &vshader_src, NULL); glCompileShader(vshader);
+    GLuint fshader = glCreateShader(GL_FRAGMENT_SHADER); glShaderSource(fshader, 1, &fshader_src, NULL); glCompileShader(fshader);
+    GLuint program = glCreateProgram(); glAttachShader(program, vshader); glAttachShader(program, fshader); glLinkProgram(program); glUseProgram(program);
+    glUniform1i(glGetUniformLocation(program, "tex"), 0);
+
+    float verts[] = { -1, -1,  1, -1,  1, 1,  -1, 1 };
+    GLuint vbo; glGenBuffers(1, &vbo); glBindBuffer(GL_ARRAY_BUFFER, vbo); glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STATIC_DRAW);
+    GLint pos_loc = glGetAttribLocation(program, "pos"); glEnableVertexAttribArray(pos_loc); glVertexAttribPointer(pos_loc, 2, GL_FLOAT, GL_FALSE, 0, 0);
+
+    // FBO Setup
+    GLuint fbo, tex_out; glGenFramebuffers(1, &fbo); glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glGenTextures(1, &tex_out); glBindTexture(GL_TEXTURE_2D, tex_out);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex_out, 0);
+
+    // Render
+    glViewport(0, 0, width, height); glClearColor(0,0,0,1); glClear(GL_COLOR_BUFFER_BIT);
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_EXTERNAL_OES, tex_external); glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+
+    // Read
+    size_t size = width * height * 4;
+    unsigned char *pixels = malloc(size);
+    glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+
+    FILE *f = fopen("screenshot.raw", "wb");
+    if (f) { fwrite(pixels, 1, size, f); fclose(f); printf("Saved screenshot.raw (%zu bytes)\n", size); }
+
+    free(pixels);
+    close(prime_fd); close(drm_fd);
+    return 0;
+}
