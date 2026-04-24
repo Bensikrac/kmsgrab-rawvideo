@@ -1,6 +1,9 @@
 # Use Case:
 - Screen capture
 - Screen capture from second Wayland compositor
+- Screen capture on Wayland to OBS using media source to play ffmpeg with FIFO
+- Replay screen to different display
+- Easy access to framebuffer for automations and such
 
 # Compile:
 Ensure necessary packages installed (wayland-headers, libdrm, libegl, libgl)
