@@ -23,3 +23,7 @@ in the directory WIP are some drafts and variants of the script, feel free to ex
 Entire code was indeed vibecoded with AI, did not expect it to work at the end, as the AI always used the wrong libs and APIs
 
 For a better and more user-friendly version look at https://git.dec05eba.com/gpu-screen-recorder/about/
+
+# Mouse Cursor not Visible:
+Kwin draws the mouse cursor on a different hardware plane for power efficiency, this only captures the first plane it can find
+to force mouse cursor to use the same plane use the environment variable KWIN_FORCE_SW_CURSOR=1
