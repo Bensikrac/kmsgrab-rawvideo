@@ -4,6 +4,9 @@
 
 # Compile:
 Ensure necessary packages installed (wayland-headers, libdrm, libegl, libgl)
+
+Edit the file to select your correct GPU ("/dev/dri/card1" is the default one, as that is usually the second one)
+
 Then run:
 
 ```gcc kmsgrab-stdout.c -o kmsgrab -ldrm -lEGL -lGL -I/usr/include/libdrm -lwayland-client```
