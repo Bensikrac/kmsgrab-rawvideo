@@ -4,6 +4,7 @@
 - Screen capture on Wayland to OBS using media source to play ffmpeg with FIFO
 - Replay screen to different display
 - Easy access to framebuffer for automations and such
+- Works with 10, 16bit pixel formats which FFMPEG does not understand, which are used by KWIN
 
 # Compile:
 Ensure necessary packages installed (wayland-headers, libdrm, libegl, libgl)
